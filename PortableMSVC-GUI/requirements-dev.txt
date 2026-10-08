@@ -1,0 +1,4 @@
+# 开发/打包环境依赖（生产运行只需 requirements.txt）
+# 打包为 exe: pip install -r requirements-dev.txt && python build_nuitka.py
+# 注意：需要可用的 C 编译器（本机 MSVC 工具链 cl.exe 或 MinGW），Nuitka 自动检测
+nuitka>=4.1

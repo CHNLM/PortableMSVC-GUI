@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行产物（下载缓存 / 生成的工具链 / 压缩包 / 旧目录备份）
+downloads/
+MSVC/
+MSVC.bak-*/
+*.7z
+*.zip
+
+# 构建产物（Nuitka standalone / 通用构建缓存）
+build/
+dist/
+*.spec.bak
+*.build/
+*.dist/
+.nuitka/
+
+# 日志
+logs/
+app.log*

@@ -1,0 +1,206 @@
+# 每月自动检测 MSVC 最新版本，有更新则构建便携版并发布 GitHub Release
+#
+# 流程：
+#   1. check job（ubuntu，轻量）：解析 VS 通道清单取最新 MSVC 版本，
+#      与本仓库已发布的 msvc-* Release 对比；
+#   2. 有更新时才触发 build job（windows，重活）：
+#      无头运行流水线（下载 MSVC+SDK → 解包瘦身 → 生成环境脚本 → 打包），
+#      归档命名为 PortableMSVC-<完整版本>.7z，并创建 Release 上传附件；
+#   3. 无更新时 build job 根本不启动（不消耗 Windows runner 配额）；
+#      手动触发（workflow_dispatch）则忽略更新判断，强制构建。
+#   4. 发布成功后清理旧 Release，仅保留最近 5 个。
+#
+# 触发方式：
+#   - schedule: 每月 1 日 02:00 UTC（北京时间 10:00），仅对默认分支生效
+#   - workflow_dispatch: 手动触发，可选择 VS 通道与目标架构组合
+#
+# 注意：
+#   - GitHub 对 60 天无任何提交的仓库会暂停 schedule 触发，届时请手动触发一次
+#   - Release tag 格式: msvc-<MSVC完整版本>，如 msvc-14.42.34433
+name: 每月 MSVC 便携版自动发布
+
+on:
+  schedule:
+    - cron: "0 2 1 * *"   # 每月 1 日 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      vs:
+        description: VS 通道（决定构建哪条工具链通道）
+        # 注意：选项须与 PortableMSVC-GUI/app/core/models.py 的 ALL_VS 保持一致
+        type: choice
+        options: ["latest", "2026", "2022", "2019"]
+        default: "latest"
+      targets:
+        description: 目标架构组合（逗号分隔；x86 用于 32 位编译，arm/arm64 会显著增大包体积）
+        type: choice
+        options:
+          - "x64,x86"
+          - "x64"
+          - "x64,x86,arm64"
+          - "x64,x86,arm,arm64"
+        default: "x64,x86"
+
+permissions:
+  contents: write         # 需要创建 Release 并上传附件
+
+# 全局环境：PYTHONUTF8=1 让 Python 以 UTF-8 模式运行（PEP 540），
+# 避免 Windows runner 默认 cp1252 编码下 print 中文抛 UnicodeEncodeError
+#（脚本内也已 reconfigure stdout/stderr 为 UTF-8，此处为双保险）。
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  check:
+    name: 检测 MSVC 是否有新版本
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.check.outputs.updated }}
+      msvc_full: ${{ steps.check.outputs.msvc_full }}
+      sdk_build: ${{ steps.check.outputs.sdk_build }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install certifi
+
+      - name: 对比清单版本与已发布 Release
+        id: check
+        run: python PortableMSVC-GUI/scripts/check_update.py --vs "${{ inputs.vs || 'latest' }}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # 把检测结果写入 job 摘要，页面直接可见（无更新 / 有新版本 / 检查失败）
+      - name: 写入检测摘要
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## MSVC 版本检测结果
+          - 状态: \`${{ steps.check.outputs.updated }}\`（true=有新版本 / false=无更新 / error=检查失败）
+          - VS 通道: \`${{ inputs.vs || 'latest' }}\`
+          - MSVC: \`${{ steps.check.outputs.msvc_full }}\`
+          - SDK:  \`${{ steps.check.outputs.sdk_build }}\`
+
+          说明: 自动触发时仅在检测到新版本才构建（无更新不消耗 Windows runner）；
+          手动触发时忽略更新判断、强制构建。
+          EOF
+
+      - name: 打印检测结果
+        if: always()
+        run: |
+          echo "updated = ${{ steps.check.outputs.updated }}"
+          echo "msvc    = ${{ steps.check.outputs.msvc_full }}"
+          echo "sdk     = ${{ steps.check.outputs.sdk_build }}"
+
+  build:
+    name: 构建便携版并发布 Release
+    needs: check
+    # 自动触发：有新版本才构建；手动触发：忽略更新判断，强制构建
+    if: needs.check.outputs.updated == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 360   # 下载+解包+打包可能耗时较长，上限 6 小时
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install certifi
+
+      # windows runner 预装 7-Zip 但不在 PATH；注入后打包器首选 7z 压缩出 .7z
+      # （若未来镜像移除 7-Zip，packager 会自动回退 tar/zip，此步无害）
+      - name: 启用 7-Zip（若存在）
+        shell: pwsh
+        run: |
+          $seven = "C:\Program Files\7-Zip"
+          if (Test-Path "$seven\7z.exe") {
+            $seven | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+            Write-Output "7-Zip 已加入 PATH"
+          } else {
+            Write-Output "未检测到 7-Zip，将由 tar/PowerShell 回退打包"
+          }
+
+      - name: 无头运行流水线（下载 MSVC + SDK 并打包）
+        id: build
+        working-directory: PortableMSVC-GUI
+        run: python scripts/build_headless.py --vs "${{ inputs.vs || 'latest' }}" --targets "${{ inputs.targets || 'x64,x86' }}"
+
+      - name: 创建 GitHub Release 并上传附件
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = "${{ steps.build.outputs.archive }}"
+          $tag     = "msvc-${{ needs.check.outputs.msvc_full }}"
+          $sdk     = "${{ needs.check.outputs.sdk_build }}"
+
+          if (-not (Test-Path $archive)) {
+            Write-Error "归档文件不存在: $archive"
+            exit 1
+          }
+
+          # 前置检查：同名 tag 的 release 已存在则中止，避免 gh 报错与重复发布
+          gh release view $tag --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Release $tag 已存在（可能被删除后 tag 残留，或重复触发），请检查后手动处理"
+            exit 1
+          }
+
+          $notes = @"
+          ## 便携版 MSVC 工具链 v${{ needs.check.outputs.msvc_full }}
+
+          由 GitHub Actions 自动检测并构建（手动或每月例行）。
+
+          ### 版本信息
+          - MSVC: v${{ needs.check.outputs.msvc_full }}
+          - Windows SDK: 10.0.$sdk.0
+          - VS 通道: ${{ inputs.vs || 'latest' }}
+          - 主机/目标架构: x64 / ${{ inputs.targets || 'x64,x86' }}
+
+          ### 使用方法
+          1. 解压压缩包到任意目录（绿色便携，无需安装 Visual Studio）
+          2. 双击运行 setup_x64.bat 配置当前命令行环境
+          3. 或运行 setup_x64_install.bat 永久写入当前用户环境变量
+          4. 重新打开 cmd / IDE 后即可使用 cl.exe / nmake 等工具
+
+          ### 许可
+          使用本工具链即代表已阅读并接受
+          [Visual Studio 许可协议](https://visualstudio.microsoft.com/license-terms/)。
+          "@
+
+          gh release create $tag $archive `
+            --title "便携版 MSVC ${{ needs.check.outputs.msvc_full }} (${{ inputs.targets || 'x64,x86' }})" `
+            --notes $notes
+
+          echo "Release 已创建: $tag"
+
+      # 仅保留最近 5 个 msvc-* Release，更旧的删除（连带 tag，避免堆积与未来冲突）
+      - name: 清理旧 Release（保留最近 5 个）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 注意：不清 stderr —— gh 认证/网络异常要可见，避免清理被静默跳过
+          $releases = gh release list --limit 100 --json tagName,createdAt,isDraft | ConvertFrom-Json
+          if (-not $releases) {
+            Write-Output "未获取到 Release 列表，跳过清理"
+            exit 0
+          }
+          $msvc = $releases |
+            Where-Object { $_.tagName -like "msvc-*" -and -not $_.isDraft } |
+            Sort-Object createdAt -Descending
+          if ($msvc.Count -le 5) {
+            Write-Output "msvc-* Release 共 $($msvc.Count) 个，无需清理"
+            exit 0
+          }
+          $old = $msvc | Select-Object -Skip 5
+          foreach ($r in $old) {
+            Write-Output "删除旧 Release: $($r.tagName)（创建于 $($r.createdAt)）"
+            gh release delete $r.tagName --yes --cleanup-tag
+          }
+          Write-Output "清理完成，保留最近 5 个: $((($msvc | Select-Object -First 5).tagName) -join ', ')"
